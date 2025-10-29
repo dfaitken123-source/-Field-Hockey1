@@ -18,8 +18,11 @@ import { Upload, Shuffle, Save, RefreshCcw, Download, CalendarClock } from "luci
 const STORAGE_KEY = "fh_tournament_v1";
 
 // Match timing
-const SLOT_MINUTES = 45; // 40 + 5 halftime
-const BUFFER_MINUTES = 15; // buffer between games
+const GAME_MINUTES = 40;
+const HALFTIME_MINUTES = 5;
+const WARMUP_MINUTES = 15;
+const SLOT_MINUTES = GAME_MINUTES + HALFTIME_MINUTES; // 40 + 5 halftime
+const BUFFER_MINUTES = WARMUP_MINUTES; // warmup buffer between games
 const REST_MINUTES = 60; // min rest between game end and next start
 const MAX_PER_DAY = 3; // per team per day
 
@@ -77,6 +80,106 @@ function roundRobin(teams) {
   return rounds; // For 6 teams → 5 rounds, 3 matches each (15 matches per pool)
 }
 
+function gatherPoolMatches(schedule) {
+  if (!schedule) return [];
+  return [
+    ...(schedule.day1 || []),
+    ...(schedule.day2 || []),
+    ...(schedule.day3 || []),
+  ].filter((match) => {
+    if (!match) return false;
+    if (match.stage) return match.stage === "pool";
+    return Boolean(match.pool);
+  });
+}
+
+function computePoolStandings(schedule, results) {
+  const allMatches = gatherPoolMatches(schedule);
+  const base = new Map();
+
+  const touch = (team, pool) => {
+    if (!team) return null;
+    if (!base.has(team.id)) {
+      base.set(team.id, {
+        id: team.id,
+        name: team.name,
+        image: team.image,
+        pool,
+        P: 0,
+        W: 0,
+        D: 0,
+        L: 0,
+        GF: 0,
+        GA: 0,
+        GD: 0,
+        PTS: 0,
+      });
+    }
+    return base.get(team.id);
+  };
+
+  const apply = (match, result) => {
+    const H = touch(match.home, match.pool);
+    const A = touch(match.away, match.pool);
+    if (!H || !A) return;
+    const hg = result.homeGoals;
+    const ag = result.awayGoals;
+    H.P += 1;
+    A.P += 1;
+    H.GF += hg;
+    H.GA += ag;
+    A.GF += ag;
+    A.GA += hg;
+    H.GD = H.GF - H.GA;
+    A.GD = A.GF - A.GA;
+    if (hg > ag) {
+      H.W += 1;
+      A.L += 1;
+      H.PTS += WIN_POINTS;
+      A.PTS += LOSS_POINTS;
+    } else if (hg < ag) {
+      A.W += 1;
+      H.L += 1;
+      A.PTS += WIN_POINTS;
+      H.PTS += LOSS_POINTS;
+    } else {
+      H.D += 1;
+      A.D += 1;
+      H.PTS += DRAW_POINTS;
+      A.PTS += DRAW_POINTS;
+    }
+  };
+
+  for (const match of allMatches) {
+    const result = results?.[match.id];
+    if (result && Number.isFinite(result.homeGoals) && Number.isFinite(result.awayGoals)) {
+      apply(match, result);
+    } else {
+      touch(match.home, match.pool);
+      touch(match.away, match.pool);
+    }
+  }
+
+  const makeTable = (poolKey) =>
+    [...base.values()]
+      .filter((team) => team.pool === poolKey)
+      .sort(
+        (a, b) =>
+          b.PTS - a.PTS ||
+          b.GD - a.GD ||
+          b.GF - a.GF ||
+          a.name.localeCompare(b.name)
+      );
+
+  return { A: makeTable("A"), B: makeTable("B") };
+}
+
+function resolveSeed(seed, standings) {
+  if (!seed || !standings) return null;
+  const list = standings[seed.pool] || [];
+  return list[seed.position - 1] || null;
+}
+
 // ---------------------------
 // Views
 // ---------------------------
@@ -87,6 +190,62 @@ function ScheduleViewPerPitch({ schedule, results }) {
     { key: "day2", label: "Day 2", start: schedule.meta.day2Start },
     { key: "day3", label: "Day 3", start: schedule.meta.day3Start },
   ];
+
+  const standings = computePoolStandings(schedule, results || {});
+
+  const displayForTeam = (team) => {
+    if (!team) return { name: "TBD", image: "" };
+    if (team.seed) {
+      const resolved = resolveSeed(team.seed, standings);
+      if (resolved) {
+        return { name: resolved.name, image: resolved.image };
+      }
+    }
+    return { name: team.name, image: team.image };
+  };
+
+  const renderMatchList = (matches) => (
+    <ul className="space-y-2">
+      {matches.map((match) => {
+        const r = results?.[match.id];
+        const home = displayForTeam(match.home);
+        const away = displayForTeam(match.away);
+        const label =
+          match.stage === "pool"
+            ? `Pool ${match.pool} • R${match.round}`
+            : match.label || "Semi-final";
+        return (
+          <li key={match.id} className="p-2 bg-white border rounded-lg text-sm flex flex-col">
+            <div className="flex justify-between text-gray-600 text-xs">
+              <span>{match.time}</span>
+              <span>{label}</span>
+            </div>
+            <div className="flex items-center justify-center gap-3 mt-1 font-medium">
+              {home.image ? (
+                <img src={home.image} alt={home.name} className="w-6 h-6 rounded object-cover" />
+              ) : (
+                <div className="w-6 h-6 rounded bg-gray-200" />
+              )}
+              <span className="truncate max-w-[40%] text-center" title={home.name}>{home.name}</span>
+              <span className="text-gray-400">vs</span>
+              <span className="truncate max-w-[40%] text-center" title={away.name}>{away.name}</span>
+              {away.image ? (
+                <img src={away.image} alt={away.name} className="w-6 h-6 rounded object-cover" />
+              ) : (
+                <div className="w-6 h-6 rounded bg-gray-200" />
+              )}
+            </div>
+            {r && (
+              <div className="mt-1 text-center text-xs text-gray-700">
+                Final: <span className="font-semibold">{r.homeGoals}</span> - <span className="font-semibold">{r.awayGoals}</span>
+              </div>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+
   return (
     <div className="space-y-6">
       {days.map((day) => (
@@ -102,39 +261,7 @@ function ScheduleViewPerPitch({ schedule, results }) {
                     {pitchMatches.length === 0 ? (
                       <p className="text-xs text-gray-500">No games</p>
                     ) : (
-                      <ul className="space-y-2">
-                        {pitchMatches.map((m) => {
-                          const r = results?.[m.id];
-                          return (
-                            <li key={m.id} className="p-2 bg-white border rounded-lg text-sm flex flex-col">
-                              <div className="flex justify-between text-gray-600 text-xs">
-                                <span>{m.time}</span>
-                                <span>Pool {m.pool} • R{m.round}</span>
-                              </div>
-                              <div className="flex items-center justify-center gap-3 mt-1 font-medium">
-                                {m.home.image ? (
-                                  <img src={m.home.image} alt={m.home.name} className="w-6 h-6 rounded object-cover" />
-                                ) : (
-                                  <div className="w-6 h-6 rounded bg-gray-200" />
-                                )}
-                                <span className="truncate max-w-[40%] text-center">{m.home.name}</span>
-                                <span className="text-gray-400">vs</span>
-                                <span className="truncate max-w-[40%] text-center">{m.away.name}</span>
-                                {m.away.image ? (
-                                  <img src={m.away.image} alt={m.away.name} className="w-6 h-6 rounded object-cover" />
-                                ) : (
-                                  <div className="w-6 h-6 rounded bg-gray-200" />
-                                )}
-                              </div>
-                              {r && (
-                                <div className="mt-1 text-center text-xs text-gray-700">
-                                  Final: <span className="font-semibold">{r.homeGoals}</span> - <span className="font-semibold">{r.awayGoals}</span>
-                                </div>
-                              )}
-                            </li>
-                          );
-                        })}
-                      </ul>
+                      renderMatchList(pitchMatches)
                     )}
                   </div>
                 );
@@ -143,17 +270,41 @@ function ScheduleViewPerPitch({ schedule, results }) {
           </CardContent>
         </Card>
       ))}
+
+      {schedule.semis?.length ? (
+        <Card className="border">
+          <CardContent className="p-4 space-y-4">
+            <h3 className="text-lg font-semibold">Semi-finals</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {Array.from({ length: schedule.meta.pitches }, (_, i) => i + 1).map((pitchNo) => {
+                const pitchMatches = schedule.semis.filter((m) => m.pitch === pitchNo);
+                if (pitchMatches.length === 0) return null;
+                return (
+                  <div key={`semi-${pitchNo}`} className="p-3 border rounded-lg bg-gray-50">
+                    <h4 className="font-medium mb-2">Pitch {pitchNo}</h4>
+                    {renderMatchList(pitchMatches)}
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
     </div>
   );
 }
 
 function ResultsPage({ schedule, results, setResults }) {
   if (!schedule) return <p className="text-sm text-gray-600">No schedule yet. Generate the schedule first.</p>;
-  const allMatches = [...schedule.day1, ...schedule.day2, ...schedule.day3];
+  const poolMatches = gatherPoolMatches(schedule);
 
   const grouped = {
-    A: allMatches.filter((m) => m.pool === "A").sort((a, b) => a.round - b.round || toMinutes(a.time) - toMinutes(b.time)),
-    B: allMatches.filter((m) => m.pool === "B").sort((a, b) => a.round - b.round || toMinutes(a.time) - toMinutes(b.time)),
+    A: poolMatches
+      .filter((m) => m.pool === "A")
+      .sort((a, b) => a.round - b.round || toMinutes(a.time) - toMinutes(b.time)),
+    B: poolMatches
+      .filter((m) => m.pool === "B")
+      .sort((a, b) => a.round - b.round || toMinutes(a.time) - toMinutes(b.time)),
   };
 
   function updateResult(match, side, value) {
@@ -165,32 +316,23 @@ function ResultsPage({ schedule, results, setResults }) {
     });
   }
 
-  function computeStandings() {
-    const base = new Map();
-    const touch = (team, pool) => {
-      if (!base.has(team.id)) base.set(team.id, { id: team.id, name: team.name, image: team.image, pool, P:0,W:0,D:0,L:0,GF:0,GA:0,GD:0,PTS:0 });
-      return base.get(team.id);
-    };
-    const apply = (m, r) => {
-      const H = touch(m.home, m.pool);
-      const A = touch(m.away, m.pool);
-      const hg = r.homeGoals, ag = r.awayGoals;
-      H.P++; A.P++; H.GF+=hg; H.GA+=ag; A.GF+=ag; A.GA+=hg; H.GD=H.GF-H.GA; A.GD=A.GF-A.GA;
-      if (hg > ag) { H.W++; A.L++; H.PTS+=WIN_POINTS; A.PTS+=LOSS_POINTS; }
-      else if (hg < ag) { A.W++; H.L++; A.PTS+=WIN_POINTS; H.PTS+=LOSS_POINTS; }
-      else { H.D++; A.D++; H.PTS+=DRAW_POINTS; A.PTS+=DRAW_POINTS; }
-    };
-    for (const m of allMatches) {
-      const r = results[m.id];
-      if (r && Number.isFinite(r.homeGoals) && Number.isFinite(r.awayGoals)) apply(m, r);
-      else { touch(m.home, m.pool); touch(m.away, m.pool); }
-    }
-    const A = [...base.values()].filter((x) => x.pool === 'A').sort((a, b) => b.PTS - a.PTS || b.GD - a.GD || b.GF - a.GF || a.name.localeCompare(b.name));
-    const B = [...base.values()].filter((x) => x.pool === 'B').sort((a, b) => b.PTS - a.PTS || b.GD - a.GD || b.GF - a.GF || a.name.localeCompare(b.name));
-    return { A, B };
-  }
+  const standings = computePoolStandings(schedule, results);
 
-  const standings = computeStandings();
+  const resolvedSemis = (schedule.semis || []).map((match) => {
+    const homeResolved = resolveSeed(match.homeSeed || match.home?.seed, standings);
+    const awayResolved = resolveSeed(match.awaySeed || match.away?.seed, standings);
+    return {
+      ...match,
+      homeDisplay: {
+        name: homeResolved?.name || match.home?.name || "TBD",
+        image: homeResolved?.image || match.home?.image || "",
+      },
+      awayDisplay: {
+        name: awayResolved?.name || match.away?.name || "TBD",
+        image: awayResolved?.image || match.away?.image || "",
+      },
+    };
+  });
 
   const PoolTable = ({ poolKey }) => (
     <div className="overflow-x-auto">
@@ -322,6 +464,69 @@ function ResultsPage({ schedule, results, setResults }) {
         <PoolEntry poolKey="A" />
         <PoolEntry poolKey="B" />
       </div>
+
+      {resolvedSemis.length > 0 && (
+        <Card className="shadow-sm">
+          <CardContent className="p-4 space-y-4">
+            <h3 className="text-lg font-semibold">Semi-finals</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {resolvedSemis.map((match) => {
+                const r = results[match.id] || { homeGoals: "", awayGoals: "" };
+                return (
+                  <div key={match.id} className="border rounded-lg overflow-hidden">
+                    <div className="flex items-center justify-between px-3 py-2 bg-gray-50 text-xs text-gray-600 border-b">
+                      <span>{match.time} • Pitch {match.pitch}</span>
+                      <span>{match.label}</span>
+                    </div>
+                    <div className="p-3 space-y-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-10 h-10 rounded overflow-hidden bg-gray-100 flex-shrink-0">
+                          {match.homeDisplay.image ? (
+                            <img src={match.homeDisplay.image} alt={match.homeDisplay.name} className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full bg-gray-200" />
+                          )}
+                        </div>
+                        <span className="font-semibold text-base flex-1 min-w-0" title={match.homeDisplay.name}>
+                          {match.homeDisplay.name}
+                        </span>
+                        <Input
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={r.homeGoals}
+                          onChange={(e) => updateResult(match, "home", e.target.value)}
+                          className="w-16 h-10 text-center text-lg font-bold flex-shrink-0"
+                          placeholder="0"
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="w-10 h-10 rounded overflow-hidden bg-gray-100 flex-shrink-0">
+                          {match.awayDisplay.image ? (
+                            <img src={match.awayDisplay.image} alt={match.awayDisplay.name} className="w-full h-full object-cover" />
+                          ) : (
+                            <div className="w-full h-full bg-gray-200" />
+                          )}
+                        </div>
+                        <span className="font-semibold text-base flex-1 min-w-0" title={match.awayDisplay.name}>
+                          {match.awayDisplay.name}
+                        </span>
+                        <Input
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={r.awayGoals}
+                          onChange={(e) => updateResult(match, "away", e.target.value)}
+                          className="w-16 h-10 text-center text-lg font-bold flex-shrink-0"
+                          placeholder="0"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
@@ -487,8 +692,16 @@ export default function TournamentHost() {
     const bRounds = roundRobin(bPool);
 
     const matchesByRound = { A: [], B: [] };
-    for (let r = 0; r < aRounds.length; r++) matchesByRound.A.push(aRounds[r].map((m) => ({ pool: "A", round: r + 1, home: m.home, away: m.away })));
-    for (let r = 0; r < bRounds.length; r++) matchesByRound.B.push(bRounds[r].map((m) => ({ pool: "B", round: r + 1, home: m.home, away: m.away })));
+    for (let r = 0; r < aRounds.length; r++) {
+      matchesByRound.A.push(
+        aRounds[r].map((m) => ({ stage: "pool", pool: "A", round: r + 1, home: m.home, away: m.away }))
+      );
+    }
+    for (let r = 0; r < bRounds.length; r++) {
+      matchesByRound.B.push(
+        bRounds[r].map((m) => ({ stage: "pool", pool: "B", round: r + 1, home: m.home, away: m.away }))
+      );
+    }
 
     // Distribute into days with per-team limits (max 3/day)
     function splitDays(matchesByRoundPool) {
@@ -661,11 +874,81 @@ export default function TournamentHost() {
     const day2Scheduled = assignTimesFromList(day2Matches, effectiveDay2Start, { fillAllPitches: true, finishBy: DAY12_FINISH_BY });
     const day3Scheduled = assignTimesFromList(day3Matches, day3Start, { fillAllPitches: true, finishBy: DAY3_FINISH_BY });
 
+    const findLastEndTime = (matches, fallback) => {
+      let latest = fallback;
+      for (const match of matches) {
+        const end = addMinutesToHHMM(match.time, SLOT_MINUTES);
+        if (toMinutes(end) > toMinutes(latest)) latest = end;
+      }
+      return latest;
+    };
+
+    const lastPoolEnd = findLastEndTime(day3Scheduled, addMinutesToHHMM(day3Start, SLOT_MINUTES));
+    const semiInitialStart = day3Scheduled.length
+      ? addMinutesToHHMM(lastPoolEnd, BUFFER_MINUTES)
+      : day3Start;
+
+    const semiSeeds = [
+      { label: "Semi-final 1", home: { pool: "A", position: 1 }, away: { pool: "B", position: 2 } },
+      { label: "Semi-final 2", home: { pool: "B", position: 1 }, away: { pool: "A", position: 2 } },
+    ];
+
+    const semiSlots = pitches >= 2
+      ? [
+          { time: semiInitialStart, pitch: 1 },
+          { time: semiInitialStart, pitch: 2 },
+        ]
+      : [
+          { time: semiInitialStart, pitch: 1 },
+          { time: addMinutesToHHMM(semiInitialStart, SLOT_MINUTES + BUFFER_MINUTES), pitch: 1 },
+        ];
+
+    const semiMatches = semiSeeds.map((seed, index) => {
+      const slot = semiSlots[index] || semiSlots[semiSlots.length - 1];
+      const homeSeed = seed.home;
+      const awaySeed = seed.away;
+      return {
+        id: matchIdCounter++,
+        stage: "semi",
+        label: seed.label,
+        time: slot.time,
+        pitch: slot.pitch,
+        round: index + 1,
+        pool: null,
+        homeSeed,
+        awaySeed,
+        home: {
+          id: `seed-${homeSeed.pool}${homeSeed.position}`,
+          name: `Pool ${homeSeed.pool} #${homeSeed.position}`,
+          image: "",
+          seed: homeSeed,
+        },
+        away: {
+          id: `seed-${awaySeed.pool}${awaySeed.position}`,
+          name: `Pool ${awaySeed.pool} #${awaySeed.position}`,
+          image: "",
+          seed: awaySeed,
+        },
+      };
+    });
+
     const result = {
-      meta: { slotMinutes: SLOT_MINUTES, buffer: BUFFER_MINUTES, rest: REST_MINUTES, pitches, day1Start, day2Start, day3Start, finishBy: DAY3_FINISH_BY, day12FinishBy: DAY12_FINISH_BY },
+      meta: {
+        slotMinutes: SLOT_MINUTES,
+        buffer: BUFFER_MINUTES,
+        rest: REST_MINUTES,
+        pitches,
+        day1Start,
+        day2Start,
+        day3Start,
+        finishBy: DAY3_FINISH_BY,
+        day12FinishBy: DAY12_FINISH_BY,
+        semiInitialStart,
+      },
       day1: day1Scheduled,
       day2: day2Scheduled,
       day3: day3Scheduled,
+      semis: semiMatches,
     };
     setSchedule(result);
     setActiveTab("schedule-view");
@@ -677,7 +960,11 @@ export default function TournamentHost() {
         <header className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold">Field Hockey Tournament Host</h1>
-            <p className="text-sm text-gray-600">12 teams → 2 pools of 6. Add team names/images, then generate a three-day round robin (max 3 games per team per day, 60 min rest, 15 min buffer). Day 3 finishes by 11:00.</p>
+            <p className="text-sm text-gray-600">
+              12 teams → 2 pools of 6. Add team names/images, then generate a three-day round robin (40 min game + 5 min halftime
+              with a 15 min warmup buffer, max 3 games per team per day, 60 min rest). Day 3 pool games finish by 11:00 followed by
+              cross-over semi-finals.
+            </p>
           </div>
           <div className="flex gap-2">
             <Button onClick={shuffleTeams}><Shuffle className="h-4 w-4 mr-2"/>Randomize Pools</Button>
@@ -787,7 +1074,7 @@ export default function TournamentHost() {
             <Card className="shadow-sm">
               <CardContent className="p-4 space-y-4">
                 <h2 className="text-xl font-semibold mb-4">Schedule Configuration</h2>
-                <div className="grid grid-cols-1 md:grid-cols-7 gap-3 items-end">
+                <div className="grid grid-cols-1 md:grid-cols-8 gap-3 items-end">
                   <div>
                     <Label htmlFor="pitches">Pitches</Label>
                     <Input id="pitches" type="number" min={1} max={6} value={pitches} onChange={(e)=> setPitches(Math.max(1, Math.min(6, Number(e.target.value)||1)))} />
@@ -805,8 +1092,12 @@ export default function TournamentHost() {
                     <Input id="day3" value={day3Start} onChange={(e)=> setDay3Start(e.target.value)} placeholder="09:00" />
                   </div>
                   <div>
-                    <Label>Slot + Buffer</Label>
-                    <div className="h-10 px-3 flex items-center border rounded-md bg-gray-50 text-gray-700">{SLOT_MINUTES} + {BUFFER_MINUTES} = {SLOT_MINUTES + BUFFER_MINUTES} min</div>
+                    <Label>Match Duration</Label>
+                    <div className="h-10 px-3 flex items-center border rounded-md bg-gray-50 text-gray-700">{GAME_MINUTES} + {HALFTIME_MINUTES} = {SLOT_MINUTES} min (game + halftime)</div>
+                  </div>
+                  <div>
+                    <Label>Warmup Buffer</Label>
+                    <div className="h-10 px-3 flex items-center border rounded-md bg-gray-50 text-gray-700">{WARMUP_MINUTES} min between matches</div>
                   </div>
                   <div>
                     <Label>Min Rest</Label>
@@ -833,9 +1124,10 @@ export default function TournamentHost() {
                     <li>• Each pool plays a full round robin (15 matches per pool = 30 total)</li>
                     <li>• Maximum 3 games per team per day</li>
                     <li>• Minimum 60 minutes rest between a team's matches</li>
-                    <li>• 15 minute buffer between all games</li>
+                    <li>• 15 minute warmup buffer between all games</li>
                     <li>• Day 1 & 2 finish at {DAY12_FINISH_BY}</li>
                     <li>• Day 3 pool matches finish by {DAY3_FINISH_BY}</li>
+                    <li>• Cross-over semi-finals scheduled after pool play wraps up</li>
                     <li>• Matches automatically rebalanced if constraints can't be met</li>
                   </ul>
                 </div>
